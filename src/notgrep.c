@@ -5,13 +5,11 @@
 #include <assert.h>
 #include <stdint.h>
 
-#define BTK_STRUTIL_IMPLEMENTATION
-#include "btk_strutil.h"
+#define ARENA_IMPLEMENTATION
+#include "arena.h"
 
-#define BTK_ARENA_IMPLEMENTATION
-#include "btk_arena.h"
-
-#include "btk_fsutil.h"
+#define FSUTIL_IMPLEMENTATION
+#include "fsutil.h"
 
 #ifdef _WIN32
 #include "windows_dirent.h"
@@ -25,6 +23,24 @@
 ///
 
 #define TRACE(msg) printf("%s:%d:%s(): %s\n", __FILE__, __LINE__, __func__, msg)
+
+typedef struct StringView {
+    const char *data;
+    size_t count;
+} StringView;
+#define SV(cstr_literal) (StringView){ .data = (cstr_literal), .count = sizeof(cstr_literal) - 1, }
+#define SV_NULL (StringView){0}
+#define SV_FMT "%.*s"
+#define SV_ARGV(sv) (int)(sv).count, (sv).data
+
+StringView sv_from_cstr(const char *cstr)
+{
+    StringView result;
+    result.count = 0;
+    for(; cstr[result.count] != 0; ++result.count);
+    result.data = cstr;
+    return result;
+}
 
 typedef struct Args {
     int count;
@@ -43,7 +59,7 @@ void usage(const char *program)
     fprintf(stderr, "   <DIR?> A directory which files will be searched. This could be empty which means, %s will look in current dir\n", program);
 }
 
-btk_stringview_t shift_args(Args *args, const char *on_error_message)
+StringView shift_args(Args *args, const char *on_error_message)
 {
     assert(args && "Invalid args pointer");
     assert(args && "Invalid on_error_message pointer");
@@ -55,10 +71,10 @@ btk_stringview_t shift_args(Args *args, const char *on_error_message)
     const char *result = args->items[0];
     args->items += 1;
     args->count -= 1;
-    return btk_sv_from_cstr(result);
+    return sv_from_cstr(result);
 }
 
-int find_with_glob(btk_stringview_t pattern, btk_stringview_t text, size_t encounter_index)
+int find_with_glob(StringView pattern, StringView text, size_t encounter_index)
 {
     size_t j = 0;
     size_t start_index = 0;
@@ -101,18 +117,18 @@ int find_with_glob(btk_stringview_t pattern, btk_stringview_t text, size_t encou
 ///
 
 typedef struct SearchResult {
-    btk_stringview_t filepath;
+    StringView filepath;
     int row;
     int col;
-    btk_stringview_t preview;
+    StringView preview;
 } SearchResult;
 
 // TODO(bagasjs): We need another way of storing result since it would be so slow if we have to copy the data when appending new result
 typedef struct SearchContext {
-    btk_stringview_t pattern;
-    btk_arena_t in_life;
-    btk_arena_t in_file;
-    btk_arena_t in_dir;
+    StringView pattern;
+    Arena in_life;
+    Arena in_file;
+    Arena in_dir;
     uint32_t find_count;
 
     char *readbuf;
@@ -124,12 +140,12 @@ typedef struct SearchContext {
     } results;
 } SearchContext;
 
-void sc_init(SearchContext *sc, btk_stringview_t pattern)
+void sc_init(SearchContext *sc, StringView pattern)
 {
     assert(sc && "Invalid sc pointer");
-    sc->in_file = (btk_arena_t){0};
-    sc->in_dir = (btk_arena_t){0};
-    sc->in_life = (btk_arena_t){0};
+    sc->in_file = (Arena){0};
+    sc->in_dir = (Arena){0};
+    sc->in_life = (Arena){0};
     sc->results.count = 0;
     sc->results.capacity = 0;
     sc->pattern = pattern;
@@ -139,9 +155,9 @@ void sc_init(SearchContext *sc, btk_stringview_t pattern)
 void sc_destroy(SearchContext *sc)
 {
     assert(sc && "Invalid sc pointer");
-    btk_arena_free(&sc->in_life);
-    btk_arena_free(&sc->in_dir);
-    btk_arena_free(&sc->in_file);
+    arena_free(&sc->in_life);
+    arena_free(&sc->in_dir);
+    arena_free(&sc->in_file);
 }
 
 void sc_append(SearchContext *sc, SearchResult res)
@@ -149,7 +165,7 @@ void sc_append(SearchContext *sc, SearchResult res)
     assert(sc && "Invalid sc pointer");
     if(sc->results.count >= sc->results.capacity) {
         sc->results.capacity = sc->results.capacity == 0 ? 1024 : sc->results.capacity*2;
-        SearchResult *new_items = btk_arena_alloc(&sc->in_life, sc->results.capacity*sizeof(SearchResult));
+        SearchResult *new_items = arena_alloc(&sc->in_life, sc->results.capacity*sizeof(SearchResult));
         memcpy(new_items, sc->results.items, sc->results.count*sizeof(SearchResult));
         sc->results.items = new_items;
     }
@@ -157,10 +173,10 @@ void sc_append(SearchContext *sc, SearchResult res)
 }
 
 // TODO(bagasjs): Regex searching
-void search_in_line(SearchContext *sc, btk_stringview_t line, btk_stringview_t filepath, size_t row)
+void search_in_line(SearchContext *sc, StringView line, StringView filepath, size_t row)
 {
     assert(sc && "Invalid sc pointer");
-    btk_stringview_t pattern = sc->pattern;
+    StringView pattern = sc->pattern;
     size_t found = 0;
     for(size_t i = 0; i < line.count; ++i) {
         if(line.data[i] == pattern.data[found]) {
@@ -171,8 +187,8 @@ void search_in_line(SearchContext *sc, btk_stringview_t line, btk_stringview_t f
                     .row = row,
                     .col = 0, // TODO(bagasjs): Get the column number
                     .filepath = filepath,
-                    .preview = (btk_stringview_t){ 
-                        .count = line.count, .data = btk_arena_bufdup(&sc->in_life, line.data, line.count) 
+                    .preview = (StringView){ 
+                        .count = line.count, .data = arena_bufdup(&sc->in_life, line.data, line.count) 
                     },
                 });
             }
@@ -185,11 +201,11 @@ void search_in_line(SearchContext *sc, btk_stringview_t line, btk_stringview_t f
 // Search in file 1st version
 // Allocate a buffer that resizable then read line by line then search in that line.
 // This won't work if the file is something like Javascript Bundled source
-void search_in_file1(SearchContext *sc, btk_stringview_t filepath)
+void search_in_file1(SearchContext *sc, StringView filepath)
 {
     assert(sc && "Invalid sc pointer");
 
-    const char *filepath_cstr = btk_arena_bufdup(&sc->in_file, filepath.data, filepath.count);
+    const char *filepath_cstr = arena_bufdup(&sc->in_file, filepath.data, filepath.count);
     FILE *fp = fopen(filepath_cstr, "r");
     assert(fp != NULL);
     size_t fsz = 0;
@@ -202,12 +218,12 @@ void search_in_file1(SearchContext *sc, btk_stringview_t filepath)
     uint32_t cur = 0;
     while((ch = fgetc(fp)) != EOF) {
         if(cur == sc->readbufsz) {
-            btk_arena_reset(&sc->in_file);
+            arena_reset(&sc->in_file);
             return;
         }
         if(ch == '\n') {
             sc->readbuf[cur] = 0;
-            search_in_line(sc, btk_sv_from_cstr(sc->readbuf), filepath, row);
+            search_in_line(sc, sv_from_cstr(sc->readbuf), filepath, row);
             row += 1;
             cur = 0;
         } else {
@@ -217,30 +233,30 @@ void search_in_file1(SearchContext *sc, btk_stringview_t filepath)
         }
     }
 
-    btk_arena_reset(&sc->in_file);
+    arena_reset(&sc->in_file);
 }
 
 // Search in file 2nd version
 // Allocate an exact sized buffer then read the file data with that buffer size. But we need somehow a way
 // to continue the check if we reached end of the file but we still don't checked all the way to the pattern
 // Maybe it would be cool if we can search for byte files like maybe an input for a hex bytes like grep 0xFFFFFF
-void search_in_file2(SearchContext *sc, btk_stringview_t filepath)
+void search_in_file2(SearchContext *sc, StringView filepath)
 {
     assert(sc && "Invalid sc pointer");
     assert(0 && "Unimplemented");
 }
 
-const char *arena_path_join(btk_arena_t *a, const char *path_a, const char *path_b)
+const char *arena_path_join(Arena *a, const char *path_a, const char *path_b)
 {
-    int res = btkfs_path_join(NULL, 0, path_a, path_b);
+    int res = path_join(NULL, 0, path_a, path_b);
     assert(res > 0 && "Failed to join path");
-    char *joined_path = btk_arena_alloc(a, sizeof(char)*res);
-    assert(btkfs_path_join(joined_path, res, path_a, path_b) == 0);
+    char *joined_path = arena_alloc(a, sizeof(char)*res);
+    assert(path_join(joined_path, res, path_a, path_b) == 0);
     return joined_path;
 }
 
 // TODO(bagasjs): Evaluating .gitignore content if it exists in the directory
-void inner_search_in_dir(SearchContext *sc, btk_stringview_t dirpath, int depth)
+void inner_search_in_dir(SearchContext *sc, StringView dirpath, int depth)
 {
     assert(sc && "Invalid sc pointer");
     struct dirent *ep = NULL;
@@ -251,17 +267,17 @@ void inner_search_in_dir(SearchContext *sc, btk_stringview_t dirpath, int depth)
             || strncmp(ep->d_name, "..", sizeof(ep->d_name)) == 0;
         if(is_cwd_or_parent) continue;
         const char *target = arena_path_join(&sc->in_dir, dirpath.data, ep->d_name);
-        if(btkfs_isdir(target)) {
-            inner_search_in_dir(sc, btk_sv_from_cstr(target), depth + 1);
+        if(path_isdir(target)) {
+            inner_search_in_dir(sc, sv_from_cstr(target), depth + 1);
         } else {
-            search_in_file1(sc, btk_sv_from_cstr(target));
+            search_in_file1(sc, sv_from_cstr(target));
         }
     }
     closedir(dp);
-    if(depth == 0) btk_arena_reset(&sc->in_dir);
+    if(depth == 0) arena_reset(&sc->in_dir);
 }
 
-void search_in_dir(SearchContext *sc, btk_stringview_t dirpath)
+void search_in_dir(SearchContext *sc, StringView dirpath)
 {
     assert(sc && "Invalid sc pointer");
     return inner_search_in_dir(sc, dirpath, 0);
@@ -269,15 +285,15 @@ void search_in_dir(SearchContext *sc, btk_stringview_t dirpath)
 
 void show_result(SearchResult res)
 {
-    printf(BTK_SV_FMT":%u:%u:"BTK_SV_FMT"\n", BTK_SV_ARGV(res.filepath), res.row, res.col, BTK_SV_ARGV(res.preview));
+    printf(SV_FMT":%u:%u:"SV_FMT"\n", SV_ARGV(res.filepath), res.row, res.col, SV_ARGV(res.preview));
 }
 
 int main(int argc, const char **argv)
 {
     SearchContext sc;
     char buf[1024];
-    btk_stringview_t pattern = BTK_SV_NULL;
-    btk_stringview_t dir = BTK_SV_NULL;
+    StringView pattern = SV_NULL;
+    StringView dir = SV_NULL;
 
     Args args;
     args.count = argc;
@@ -294,13 +310,13 @@ int main(int argc, const char **argv)
     if(args.count > 0) {
         dir = shift_args(&args, "Unreachable");
     } else {
-        int res = btkfs_getcwd(NULL, 0);
+        int res = path_getcwd(NULL, 0);
         assert(res >= 0);
-        char *dir1 = btk_arena_alloc(&sc.in_life, sizeof(char)*res);
-        assert(btkfs_getcwd(dir1, res) >= 0);
+        char *dir1 = arena_alloc(&sc.in_life, sizeof(char)*res);
+        assert(path_getcwd(dir1, res) >= 0);
 
         // This will safe since we allocate it for the life time of search context
-        dir = btk_sv_from_cstr(dir1);
+        dir = sv_from_cstr(dir1);
     }
 
     search_in_dir(&sc, dir);

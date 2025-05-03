@@ -5,7 +5,9 @@ A simple subset grep implementation
 `sh
 ./grep [OPTIONS] <pattern> <path?>
 `
+
 Positional Arguments:
+
 <pattern> 
 The search pattern
 
