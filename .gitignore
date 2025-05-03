@@ -1,1 +1,2 @@
-grep.exe
+*.exe
+*.pdb
